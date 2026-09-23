@@ -96,7 +96,7 @@ HAS_QR_CAPABILITY = HAS_CV2 or HAS_PYZBAR
 
 # Higher DPI gives QR detection more pixels to work with — real certificates
 # often have a small QR in a corner that's easy to miss at low resolution.
-RASTER_DPI = 400
+RASTER_DPI = 150
 
 
 def _rasterize_to_temp_image(path: str) -> Optional[str]:
