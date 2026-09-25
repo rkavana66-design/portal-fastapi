@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     smtp_user: str
     smtp_pass: str
     email_from: str
+    resend_api_key: str = ""
 
     trusted_issuer_domains: str = "credly.com,cisco.com,nptel.ac.in,coursera.org,aicte-india.org"
     upload_dir: str = "uploads"
