@@ -1,21 +1,26 @@
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import httpx
 
 from app.core.config import settings
 
 
 def send_email(to: str, subject: str, html: str) -> None:
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = settings.email_from
-    msg["To"] = to
-    msg.attach(MIMEText(html, "html"))
-
-    with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
-        server.starttls()
-        server.login(settings.smtp_user, settings.smtp_pass)
-        server.sendmail(settings.smtp_user, [to], msg.as_string())
+    try:
+        response = httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {settings.resend_api_key}"},
+            json={
+                "from": settings.email_from,
+                "to": [to],
+                "subject": subject,
+                "html": html,
+            },
+            timeout=10,
+        )
+        response.raise_for_status()
+    except Exception as e:
+        # Never let an email failure crash the request that triggered it —
+        # same resilience pattern used elsewhere in this backend.
+        print(f"[EMAIL] Failed to send to {to}: {e}")
 
 
 def verification_email_html(link: str, name: str) -> str:
