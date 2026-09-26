@@ -38,7 +38,6 @@ def _create_verification_token(db: Session, user: User, purpose: str, hours: int
 
 
 # ---------- SIGNUP ----------
-# ---------- SIGNUP ----------
 @router.post("/signup", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
 def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     domain = payload.email.split("@")[1].lower()
@@ -56,7 +55,7 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
         email=payload.email.lower(),
         password_hash=hash_password(payload.password),
         role=payload.role,
-        is_verified=True,
+        is_verified=False,
     )
     db.add(user)
     db.flush()  # get user.id before commit
@@ -76,7 +75,11 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(user)
 
-    return MessageResponse(message="Account created. You can log in now.")
+    raw_token = _create_verification_token(db, user, "verify_email", VERIFY_TOKEN_HOURS)
+    link = f"{settings.client_url}/verify-email/{raw_token}"
+    send_email(user.email, "Verify your email — Placement Portal", verification_email_html(link, payload.name))
+
+    return MessageResponse(message="Account created. Check your email to verify your account before logging in.")
 
 
 # ---------- VERIFY EMAIL ----------
@@ -125,6 +128,9 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
     user = db.query(User).filter(User.email == payload.email.lower()).first()
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    if not user.is_verified:
+        raise HTTPException(status_code=403, detail="Please verify your email before logging in.")
 
     name = user.student.name if user.student else (user.recruiter.name if user.recruiter else "")
     token = create_access_token({"sub": str(user.id), "role": user.role.value, "email": user.email})
