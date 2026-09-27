@@ -36,14 +36,3 @@ app.include_router(insights.router)
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/api/temp-add-college-column/{secret}")
-def temp_add_college_column(secret: str):
-    if secret != "add-college-12345":
-        return {"error": "wrong secret"}
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        conn.execute(text("ALTER TABLE students ADD COLUMN IF NOT EXISTS college VARCHAR"))
-        conn.commit()
-    return {"status": "college column added (or already existed) — safe, no data was touched"}
