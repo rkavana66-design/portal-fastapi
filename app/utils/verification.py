@@ -302,7 +302,34 @@ def check_certificate_holder(qr_text: Optional[str], account_name: Optional[str]
     return {"qr_name": qr_name, "name_match": name_match}
 
 
-# ---------- b2) OCR-based text extraction (works without any QR code) ----------
+# ---------- b2) Native PDF text extraction (works without OCR) ----------
+def extract_certificate_text_native(file_path: str) -> Optional[str]:
+    """
+    Reads a PDF's actual embedded text layer directly — fundamentally
+    different from OCR (which "looks" at an image and guesses letters from
+    pixels). Most digitally-generated certificates (issued by a college
+    portal or an official system, as opposed to a scanned photo of a printed
+    page) have genuine text built into the file itself, which this reads
+    instantly and with total accuracy — no image analysis, no heavy
+    libraries, no memory risk. Returns None for image-only PDFs (e.g. a
+    scanned photo of a paper certificate), which genuinely have no embedded
+    text layer to read — that case still needs OCR, which remains a
+    separate, optional fallback.
+    """
+    if not file_path.lower().endswith(".pdf") or not HAS_FITZ:
+        return None
+    try:
+        doc = fitz.open(file_path)
+        text = " ".join(page.get_text() for page in doc)
+        doc.close()
+        text = text.strip().lower()
+        return text if text else None
+    except Exception as e:
+        print(f"[VERIFICATION] Native PDF text extraction failed: {e}")
+        return None
+
+
+# ---------- b3) OCR-based text extraction (fallback for scanned/image-only PDFs) ----------
 
 # A starter list of well-known certificate issuers to look for in the OCR'd
 # text. This is intentionally small and easy to extend — add more as you
@@ -320,11 +347,11 @@ def extract_certificate_text(file_path: str) -> Optional[str]:
     Runs OCR over the certificate's first page and returns all recognized
     text as one lowercase string, or None if OCR isn't available or fails.
 
-    This exists specifically for certificates that have NO embedded QR code
-    (the majority of real-world certificates) — instead of only being able
-    to say "no QR found, can't verify", we can now actually read the
-    certificate and check whether it plausibly belongs to this student and
-    names a recognizable issuer.
+    This is the fallback for certificates that have NO embedded text layer AT
+    ALL — typically a scanned photo of a printed page. Most digitally-issued
+    certificates never reach this function at all, since
+    extract_certificate_text_native() above already reads their real text
+    directly, for free and instantly.
 
     Important honesty note: this is a WEAKER signal than a QR code linking
     to a trusted domain. Printed text can be faked far more easily than a
@@ -357,14 +384,15 @@ def check_certificate_text(
     ocr_text: Optional[str], account_name: Optional[str]
 ) -> dict:
     """
-    Given the OCR'd certificate text, checks two things:
+    Given the certificate's text (from either native PDF extraction or OCR),
+    checks two things:
       1. Does the student's own name appear on the certificate?
       2. Does a recognized issuer's name appear on the certificate?
 
     Returns:
         {"name_found": bool | None, "issuer_found": str | None}
 
-    Both are None (not False) when OCR text wasn't available at all, to
+    Both are None (not False) when no text was available at all, to
     keep the same "checked vs. never checked" distinction used elsewhere.
     """
     if not ocr_text:
@@ -373,7 +401,7 @@ def check_certificate_text(
     name_found = None
     if account_name:
         # Match on individual name parts rather than requiring the exact
-        # full name in the exact order — OCR line-breaks and certificate
+        # full name in the exact order — text extraction and certificate
         # layouts often split or reorder a name (e.g. "Kavana" on one line,
         # "R" on the next).
         parts = [p for p in re.sub(r"[^a-zA-Z ]", "", account_name.lower()).split() if len(p) > 1]
@@ -487,12 +515,12 @@ def compute_verification_status(
     - QR found + trusted domain, but the certificate holder's name does NOT
       match the account -> "suspicious" (a validly-issued certificate that
       simply isn't this student's)
-    - No QR, but OCR finds BOTH the student's own name AND a recognized
-      issuer printed on the certificate, with no editing-software hint ->
-      "verified", but explicitly noted as a text-match, not a cryptographic
-      one — this is the fallback for the majority of real certificates that
-      simply don't have a QR code at all
-    - QR missing (and OCR didn't find a confident match), or domain
+    - No QR, but the certificate's text (read natively from the PDF, or via
+      OCR as a fallback) shows BOTH the student's own name AND a recognized
+      issuer, with no editing-software hint -> "verified", but explicitly
+      noted as a text-match, not a cryptographic one — this is the fallback
+      for the majority of real certificates that simply don't have a QR code
+    - QR missing (and text didn't find a confident match), or domain
       untrusted/unknown, or an editing-software hint alone -> "suspicious"
     - Editing-software hint (image EXIF OR PDF producer/creator field)
       COMBINED with a missing/untrusted QR -> "rejected" (two independent
