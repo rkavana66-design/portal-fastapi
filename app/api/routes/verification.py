@@ -13,8 +13,8 @@ from app.schemas.verification import (
 )
 from app.utils.verification import (
     extract_qr_code, check_qr_domain, check_certificate_holder, basic_image_tamper_checks,
-    extract_certificate_text, check_certificate_text, check_pdf_producer_metadata,
-    compute_verification_status,
+    extract_certificate_text, extract_certificate_text_native, check_certificate_text,
+    check_pdf_producer_metadata, compute_verification_status,
 )
 from app.utils.external_verification import (
     verify_github_profile, verify_leetcode_profile,
@@ -39,17 +39,18 @@ def _get_document_or_404(document_id: UUID, db: Session) -> Document:
 # ---------- Background worker: does the actual (slow) scanning work ----------
 def _run_document_scan(document_id: UUID) -> None:
     """
-    Runs the full QR + OCR + tamper analysis and writes the final result to
+    Runs the full QR + text + tamper analysis and writes the final result to
     the database. Executes in a background task, AFTER the HTTP response
     has already been sent — so it needs its own database session, since the
     request's session closes as soon as the response goes out.
 
-    This exists specifically because OCR (EasyOCR/PyTorch) can take anywhere
-    from a few seconds to a few minutes, especially on its first run. Making
-    the student's browser wait synchronously for that risks a real timeout
-    on most hosting platforms (many kill requests around 30 seconds) — so
-    the upload returns instantly with "pending", and this function updates
-    the real result a bit later. The frontend polls for it.
+    This exists specifically because OCR (EasyOCR/PyTorch, used only as a
+    last-resort fallback below) can take anywhere from a few seconds to a few
+    minutes on its first run. Making the student's browser wait synchronously
+    for that risks a real timeout on most hosting platforms (many kill
+    requests around 30 seconds) — so the upload returns instantly with
+    "pending", and this function updates the real result a bit later. The
+    frontend polls for it.
     """
     db = SessionLocal()
     try:
@@ -68,8 +69,13 @@ def _run_document_scan(document_id: UUID) -> None:
 
         ocr_info = None
         if not qr_info.get("qr_found"):
-            ocr_text = extract_certificate_text(document.file_path)
-            ocr_info = check_certificate_text(ocr_text, account_name)
+            # Prefer reading the PDF's real embedded text (free, instant,
+            # works for anything digitally generated) — only fall back to
+            # OCR for genuinely image-only PDFs, like a scanned paper.
+            text = extract_certificate_text_native(document.file_path)
+            if text is None:
+                text = extract_certificate_text(document.file_path)
+            ocr_info = check_certificate_text(text, account_name)
 
         status_value, details = compute_verification_status(
             qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
