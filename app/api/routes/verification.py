@@ -76,7 +76,7 @@ def _run_document_scan(document_id: UUID) -> None:
             text = extract_certificate_text_native(document.file_path)
             if text is None:
                 text = extract_certificate_text(document.file_path)
-            ocr_info = check_certificate_text(text, account_name)
+            ocr_info = check_certificate_text(text, account_name, owner.college if owner else None)
 
         status_value, details = compute_verification_status(
             qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
