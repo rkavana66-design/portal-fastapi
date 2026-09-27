@@ -498,6 +498,35 @@ def check_pdf_producer_metadata(file_path: str) -> dict:
         return {"pdf_tool_found": None}
 
 
+def check_pdf_has_design_elements(file_path: str) -> dict:
+    """
+    Checks whether the PDF contains any embedded images at all — logos,
+    borders, seals, decorative graphics. Real certificates are almost always
+    visually designed documents; a quickly faked one (typed text with no
+    design work) frequently has none. This is one more honest signal, not a
+    certainty check — someone determined could still add a logo image to a
+    fake, and a text-only real letter genuinely exists too. It exists purely
+    to raise the bar against the easiest, laziest kind of fake: plain typed
+    text claiming to be a certificate.
+
+    Returns:
+        {"has_images": bool | None}
+
+    None means the file isn't a PDF or couldn't be read — same "checked vs.
+    couldn't check" honesty pattern used throughout this module.
+    """
+    if not file_path.lower().endswith(".pdf") or not HAS_FITZ:
+        return {"has_images": None}
+    try:
+        doc = fitz.open(file_path)
+        has_images = any(len(page.get_images()) > 0 for page in doc)
+        doc.close()
+        return {"has_images": has_images}
+    except Exception as e:
+        print(f"[VERIFICATION] Design-element check failed: {e}")
+        return {"has_images": None}
+
+
 # ---------- d) Compute overall status ----------
 def compute_verification_status(
     qr_info: dict,
@@ -505,6 +534,7 @@ def compute_verification_status(
     holder_info: Optional[dict] = None,
     ocr_info: Optional[dict] = None,
     pdf_tool_info: Optional[dict] = None,
+    design_info: Optional[dict] = None,
 ) -> tuple[str, dict]:
     """
     Simple, explainable rule set:
@@ -517,9 +547,14 @@ def compute_verification_status(
       simply isn't this student's)
     - No QR, but the certificate's text (read natively from the PDF, or via
       OCR as a fallback) shows BOTH the student's own name AND a recognized
-      issuer, with no editing-software hint -> "verified", but explicitly
-      noted as a text-match, not a cryptographic one — this is the fallback
-      for the majority of real certificates that simply don't have a QR code
+      issuer, AND the document has real design elements (a logo/seal/
+      graphics, not just bare typed text), with no editing-software hint ->
+      "verified", but explicitly noted as a text-match, not a cryptographic
+      one — this is the fallback for real certificates that don't have a QR
+      code, while still rejecting the laziest kind of fake (plain typed text
+      with nothing else)
+    - Same text/issuer match, but NO design elements at all -> "suspicious"
+      (unusual for a real certificate — worth a manual check)
     - QR missing (and text didn't find a confident match), or domain
       untrusted/unknown, or an editing-software hint alone -> "suspicious"
     - Editing-software hint (image EXIF OR PDF producer/creator field)
@@ -532,6 +567,7 @@ def compute_verification_status(
     holder_info = holder_info or {"qr_name": None, "name_match": None}
     ocr_info = ocr_info or {"name_found": None, "issuer_found": None}
     pdf_tool_info = pdf_tool_info or {"pdf_tool_found": None}
+    design_info = design_info or {"has_images": None}
 
     if not HAS_QR_CAPABILITY:
         return "pending", {
@@ -555,6 +591,7 @@ def compute_verification_status(
     ocr_name_found = ocr_info.get("name_found")
     ocr_issuer_found = ocr_info.get("issuer_found")
     pdf_tool_found = pdf_tool_info.get("pdf_tool_found")
+    has_images = design_info.get("has_images")
 
     editing_software_hint = False
     software = (tamper_signals.get("exif_software") or "").lower()
@@ -581,12 +618,18 @@ def compute_verification_status(
     elif qr_found and domain_trusted and not editing_software_hint:
         status = "verified"
         notes = "QR code found and matches a trusted issuer domain. No obvious editing signals detected."
-    elif not qr_found and ocr_confident_match and not editing_software_hint:
+    elif not qr_found and ocr_confident_match and not editing_software_hint and has_images:
         status = "verified"
-        notes = (f"No QR code found, but the certificate text matches your account name and names "
-                 f"a recognized issuer (\"{ocr_issuer_found}\"). Note: this is a text-based match, "
-                 f"not a cryptographic one — weaker evidence than a verified QR code, but a real "
-                 f"signal for certificates that don't include a QR code at all.")
+        notes = (f"No QR code found, but the certificate text matches your account name, names "
+                 f"a recognized issuer (\"{ocr_issuer_found}\"), and includes real design elements "
+                 f"(logo/seal/graphics). Note: this is a text-based match, not a cryptographic one — "
+                 f"weaker evidence than a verified QR code, but a real signal for certificates that "
+                 f"don't include a QR code at all.")
+    elif not qr_found and ocr_confident_match and not editing_software_hint and has_images is False:
+        status = "suspicious"
+        notes = (f"The certificate text names you and a recognized issuer (\"{ocr_issuer_found}\"), "
+                 f"but the document has no logo, seal, or design elements at all — unusual for a real "
+                 f"certificate and worth a manual check.")
     elif not qr_found:
         status = "suspicious"
         if pdf_tool_found:
@@ -623,6 +666,7 @@ def compute_verification_status(
         "ocr_issuer_found": ocr_issuer_found,
         "tamper_signals": tamper_signals,
         "pdf_tool_found": pdf_tool_found,
+        "has_images": has_images,
         "notes": notes,
     }
     return status, details
