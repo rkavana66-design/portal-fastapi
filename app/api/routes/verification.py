@@ -13,7 +13,7 @@ from app.schemas.verification import (
 )
 from app.utils.verification import (
     extract_qr_code, check_qr_domain, check_certificate_holder, basic_image_tamper_checks,
-    extract_certificate_text, check_certificate_text,
+    extract_certificate_text, check_certificate_text, check_pdf_producer_metadata,
     compute_verification_status,
 )
 from app.utils.external_verification import (
@@ -64,6 +64,7 @@ def _run_document_scan(document_id: UUID) -> None:
         qr_info = check_qr_domain(qr_text, _trusted_domains())
         holder_info = check_certificate_holder(qr_text, account_name)
         tamper_signals = basic_image_tamper_checks(document.file_path)
+        pdf_tool_info = check_pdf_producer_metadata(document.file_path)
 
         ocr_info = None
         if not qr_info.get("qr_found"):
@@ -71,7 +72,8 @@ def _run_document_scan(document_id: UUID) -> None:
             ocr_info = check_certificate_text(ocr_text, account_name)
 
         status_value, details = compute_verification_status(
-            qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info, ocr_info=ocr_info
+            qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
+            ocr_info=ocr_info, pdf_tool_info=pdf_tool_info,
         )
 
         document.verification_status = status_value
