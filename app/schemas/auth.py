@@ -9,6 +9,7 @@ class SignupRequest(BaseModel):
     password: str = Field(min_length=8)
     role: UserRole = UserRole.student
     discipline: Optional[str] = None       # for students
+    college: Optional[str] = None          # for students
     designation: Optional[str] = None      # for recruiters
 
 
