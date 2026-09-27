@@ -36,12 +36,3 @@ app.include_router(insights.router)
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/api/danger-wipe-database/{secret}")
-def danger_wipe_database(secret: str):
-    if secret != "wipe-me-12345":
-        return {"error": "wrong secret"}
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-    return {"status": "Database wiped clean. All data deleted."}
