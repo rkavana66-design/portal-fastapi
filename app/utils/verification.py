@@ -381,13 +381,18 @@ def extract_certificate_text(file_path: str) -> Optional[str]:
 
 
 def check_certificate_text(
-    ocr_text: Optional[str], account_name: Optional[str]
+    ocr_text: Optional[str], account_name: Optional[str], account_college: Optional[str] = None
 ) -> dict:
     """
     Given the certificate's text (from either native PDF extraction or OCR),
     checks two things:
       1. Does the student's own name appear on the certificate?
-      2. Does a recognized issuer's name appear on the certificate?
+      2. Does a recognized issuer's name appear on the certificate — either
+         a well-known global platform (Coursera, Cisco, etc.) OR the
+         student's own stated college name from their profile? Checking
+         against the student's own college works for every student from
+         every institution automatically, without needing every college in
+         the world hardcoded into KNOWN_ISSUER_KEYWORDS.
 
     Returns:
         {"name_found": bool | None, "issuer_found": str | None}
@@ -408,6 +413,11 @@ def check_certificate_text(
         name_found = bool(parts) and all(part in ocr_text for part in parts)
 
     issuer_found = next((k for k in KNOWN_ISSUER_KEYWORDS if k in ocr_text), None)
+
+    if not issuer_found and account_college:
+        college_clean = account_college.strip().lower()
+        if college_clean and college_clean in ocr_text:
+            issuer_found = account_college.strip()
 
     return {"name_found": name_found, "issuer_found": issuer_found}
 
