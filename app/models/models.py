@@ -40,6 +40,7 @@ class Student(Base):
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), unique=True, nullable=False)
     name = Column(String, nullable=False)
     discipline = Column(String, nullable=True)  # e.g. IT, Medical, Healthcare-Tech
+    college = Column(String, nullable=True)  # e.g. "Sapthagiri NPS University" — used to recognize this student's own institution on certificates
     github_url = Column(String, nullable=True)
     linkedin_url = Column(String, nullable=True)
     leetcode_url = Column(String, nullable=True)
