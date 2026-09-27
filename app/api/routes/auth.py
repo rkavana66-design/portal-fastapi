@@ -61,7 +61,7 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     db.flush()  # get user.id before commit
 
     if payload.role == UserRole.student:
-        db.add(Student(user_id=user.id, name=payload.name, discipline=payload.discipline))
+        db.add(Student(user_id=user.id, name=payload.name, discipline=payload.discipline, college=payload.college))
     elif payload.role == UserRole.recruiter:
         org = db.query(RecruiterOrg).filter(RecruiterOrg.domain == domain).first()
         if org is None:
