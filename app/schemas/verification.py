@@ -22,7 +22,7 @@ class AdminDocumentListItem(BaseModel):
     student_id: UUID
     student_name: Optional[str] = None
     type: str
-    file_path: str
+    file_url: str
     verification_status: str
     verification_details: Optional[dict[str, Any]] = None
     created_at: str
