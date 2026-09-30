@@ -194,12 +194,17 @@ def list_all_documents(
     db: Session = Depends(get_db),
 ):
     documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    student_ids = {d.student_id for d in documents}
+    students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
     return [
         AdminDocumentListItem(
             id=d.id,
             student_id=d.student_id,
+            student_name=students[d.student_id].name if d.student_id in students else None,
             type=d.type,
+            file_path=d.file_path,
             verification_status=d.verification_status,
+            verification_details=d.verification_details,
             created_at=d.created_at.isoformat() if d.created_at else "",
         )
         for d in documents
