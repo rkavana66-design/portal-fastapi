@@ -20,8 +20,11 @@ class ManualVerifyRequest(BaseModel):
 class AdminDocumentListItem(BaseModel):
     id: UUID
     student_id: UUID
+    student_name: Optional[str] = None
     type: str
+    file_path: str
     verification_status: str
+    verification_details: Optional[dict[str, Any]] = None
     created_at: str
 
     class Config:
