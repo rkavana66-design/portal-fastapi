@@ -1,4 +1,5 @@
 from uuid import UUID
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -23,6 +24,13 @@ from app.utils.external_verification import (
 from app.core.config import settings
 
 router = APIRouter(prefix="/api/verification", tags=["verification"])
+
+# Your backend's real, public address — needed to build a URL the admin's
+# browser can actually open, since file_path is just a local disk path on
+# the server. (Mirrors the same pattern used for profile photos in
+# app/api/routes/student.py, which is hardcoded to localhost there — a
+# good thing to fix there too, later.)
+BACKEND_BASE_URL = "https://portal-fastapi.onrender.com"
 
 
 def _trusted_domains() -> list[str]:
@@ -196,13 +204,24 @@ def list_all_documents(
     documents = db.query(Document).order_by(Document.created_at.desc()).all()
     student_ids = {d.student_id for d in documents}
     students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
+    upload_root = Path(settings.upload_dir)
+
+    def _file_url(file_path: str) -> str:
+        try:
+            relative = Path(file_path).relative_to(upload_root).as_posix()
+            return f"{BACKEND_BASE_URL}/uploads/{relative}"
+        except ValueError:
+            # Fallback: file_path wasn't under upload_root for some reason —
+            # better to show something than crash the whole list.
+            return file_path
+
     return [
         AdminDocumentListItem(
             id=d.id,
             student_id=d.student_id,
             student_name=students[d.student_id].name if d.student_id in students else None,
             type=d.type,
-            file_path=d.file_path,
+            file_url=_file_url(d.file_path),
             verification_status=d.verification_status,
             verification_details=d.verification_details,
             created_at=d.created_at.isoformat() if d.created_at else "",
