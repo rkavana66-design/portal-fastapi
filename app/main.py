@@ -55,15 +55,3 @@ def temp_fix_admin_email(secret: str):
         return {"status": "Admin email updated.", "new_email": "admin@setuportal.org"}
     finally:
         db.close()
-
-
-@app.get("/api/temp-add-shuffle-columns/{secret}")
-def temp_add_shuffle_columns(secret: str):
-    if secret != "add-shuffle-33221":
-        return {"error": "wrong secret"}
-    from sqlalchemy import text
-    with engine.connect() as conn:
-        conn.execute(text("ALTER TABLE test_attempts ADD COLUMN IF NOT EXISTS question_order JSON"))
-        conn.execute(text("ALTER TABLE test_attempts ADD COLUMN IF NOT EXISTS option_orders JSON"))
-        conn.commit()
-    return {"status": "shuffle columns added (or already existed) — safe, no data was touched"}
