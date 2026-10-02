@@ -1,4 +1,5 @@
 import uuid
+import random
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
@@ -130,14 +131,39 @@ def start_test(
     if test is None:
         raise HTTPException(status_code=404, detail="Test not found or not active")
 
-    attempt = TestAttempt(student_id=student.id, test_id=test.id, status="in_progress")
+    # Shuffle question order for this attempt, and independently shuffle each
+    # question's option order too — so the test looks different every time,
+    # without ever changing which answer is actually correct.
+    shuffled_questions = list(test.questions)
+    random.shuffle(shuffled_questions)
+
+    question_order = [str(q.id) for q in shuffled_questions]
+    option_orders: dict[str, list[int]] = {}
+    student_facing_questions = []
+
+    for q in shuffled_questions:
+        # original_positions[i] tells us which ORIGINAL option index is now
+        # shown at shuffled position i — this is what lets us grade correctly
+        # later, no matter how the options were shuffled for this student.
+        original_positions = list(range(len(q.options)))
+        random.shuffle(original_positions)
+        shuffled_options = [q.options[i] for i in original_positions]
+
+        option_orders[str(q.id)] = original_positions
+        student_facing_questions.append(
+            QuestionForStudent(id=q.id, text=q.text, options=shuffled_options)
+        )
+
+    attempt = TestAttempt(
+        student_id=student.id,
+        test_id=test.id,
+        status="in_progress",
+        question_order=question_order,
+        option_orders=option_orders,
+    )
     db.add(attempt)
     db.commit()
     db.refresh(attempt)
-
-    questions = [
-        QuestionForStudent(id=q.id, text=q.text, options=q.options) for q in test.questions
-    ]
 
     return StartAttemptResponse(
         attempt_id=attempt.id,
@@ -145,7 +171,7 @@ def start_test(
         title=test.title,
         duration_minutes=test.duration_minutes,
         started_at=attempt.started_at,
-        questions=questions,
+        questions=student_facing_questions,
     )
 
 
@@ -163,12 +189,27 @@ def submit_attempt(
 
     test = db.query(Test).filter(Test.id == attempt.test_id).first()
     questions = {str(q.id): q for q in test.questions}
+    option_orders = attempt.option_orders or {}
 
     total_marks = sum(q.marks for q in questions.values())
     score = 0
-    for question_id, selected_option in payload.answers.items():
+    for question_id, selected_shuffled_index in payload.answers.items():
         question = questions.get(question_id)
-        if question is not None and selected_option == question.correct_option:
+        if question is None:
+            continue
+        # The student selected a position in THEIR shuffled option list —
+        # translate it back to the original option index before comparing,
+        # since correct_option always refers to the original, unshuffled order.
+        positions = option_orders.get(question_id)
+        if positions and 0 <= selected_shuffled_index < len(positions):
+            actual_original_index = positions[selected_shuffled_index]
+        else:
+            # No shuffle recorded for this question (e.g. an older attempt
+            # from before this feature existed) — fall back to treating the
+            # answer as already being in original-option terms.
+            actual_original_index = selected_shuffled_index
+
+        if actual_original_index == question.correct_option:
             score += question.marks
 
     percent = round((score / total_marks) * 100, 1) if total_marks > 0 else 0.0
