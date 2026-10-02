@@ -199,6 +199,8 @@ class TestAttempt(Base):
 
     status = Column(String, nullable=False, default="in_progress")  # in_progress | completed | disqualified | abandoned
     answers = Column(JSON, nullable=True)  # {question_id: selected_option_index}
+    question_order = Column(JSON, nullable=True)  # [question_id, ...] — the shuffled order shown to this student
+    option_orders = Column(JSON, nullable=True)  # {question_id: [original_option_index, ...]} — shuffled option mapping per question
     score = Column(Float, nullable=True)  # marks obtained
     total_marks = Column(Float, nullable=True)
     percent = Column(Float, nullable=True)
