@@ -55,3 +55,39 @@ def temp_fix_admin_email(secret: str):
         return {"status": "Admin email updated.", "new_email": "admin@setuportal.org"}
     finally:
         db.close()
+
+
+@app.get("/api/temp-add-coding-question/{secret}")
+def temp_add_coding_question(secret: str):
+    if secret != "add-coding-q-45190":
+        return {"error": "wrong secret"}
+    from app.db.session import SessionLocal
+    from app.models.models import Test, Question
+
+    db = SessionLocal()
+    try:
+        test = db.query(Test).filter(Test.title == "Python Basics").first()
+        if test is None:
+            return {"error": "Python Basics test not found — seed assessment data first."}
+
+        existing = db.query(Question).filter(
+            Question.test_id == test.id, Question.question_type == "coding"
+        ).first()
+        if existing:
+            return {"status": "A coding question already exists on this test."}
+
+        question = Question(
+            test_id=test.id,
+            question_type="coding",
+            text="Write a function that prints the sum of 2 and 3. Your program should print only the number 5.",
+            starter_code="# Write your code below\nprint(2 + 3)\n",
+            language="python",
+            expected_output="5",
+            marks=5,
+            order_index=99,
+        )
+        db.add(question)
+        db.commit()
+        return {"status": "Coding question added to Python Basics."}
+    finally:
+        db.close()
