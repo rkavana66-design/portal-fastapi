@@ -55,3 +55,12 @@ def temp_fix_admin_email(secret: str):
         return {"status": "Admin email updated.", "new_email": "admin@setuportal.org"}
     finally:
         db.close()
+
+
+@app.get("/api/temp-seed-tests/{secret}")
+def temp_seed_tests(secret: str):
+    if secret != "seed-tests-77410":
+        return {"error": "wrong secret"}
+    from scripts.seed_assessment_data import seed
+    seed()
+    return {"status": "Seeding attempted — check logs for details, or check /api/assessment/tests afterward."}
