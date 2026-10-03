@@ -1,13 +1,17 @@
 """
 Executes student-submitted code via Piston (https://github.com/engineer-man/piston),
-a free, public code-execution API — no account or API key needed. Code runs entirely
-on Piston's own servers, in their sandbox, completely separate from this backend.
-This means a student's code (even buggy or resource-heavy code) can never affect or
-crash this server — a deliberate choice after this project's earlier experience with
-heavy processing (OCR) exceeding this server's own resources.
+a free, public code-execution API. Code runs entirely on Piston's own servers, in
+their sandbox, completely separate from this backend. This means a student's code
+(even buggy or resource-heavy code) can never affect or crash this server — a
+deliberate choice after this project's earlier experience with heavy processing
+(OCR) exceeding this server's own resources.
 
-Piston is a shared public service with reasonable-use rate limits — fine for a
-classroom/hackathon-scale assessment tool, not meant for massive production traffic.
+IMPORTANT, as of Feb 2026: Piston's public API is no longer freely available
+without an approved key (see https://github.com/engineer-man/piston). Until a
+paid/approved execution service is configured, run_code() below will fail
+gracefully — returning a clear, honest message rather than crashing or exposing
+a raw technical error to students. The code editor, question, and submission
+flow all still work; only the actual execution is blocked.
 """
 
 import httpx
@@ -60,10 +64,13 @@ def run_code(language: str, code: str, stdin: str = "") -> dict:
         response = httpx.post(PISTON_API_URL, json=payload, timeout=RUN_TIMEOUT_SECONDS)
         response.raise_for_status()
         data = response.json()
-    except Exception as e:
+    except Exception:
+        # The public Piston API has moved to a paid/approval-only model as of
+        # Feb 2026 — this is a known, honest limitation, not a bug. Shown to
+        # the student as a clear message rather than a raw technical error.
         return {
             "stdout": "",
-            "stderr": f"Could not reach the code execution service: {e}",
+            "stderr": "Code execution is temporarily unavailable. Your code has been saved — please continue with the rest of the test.",
             "success": False,
         }
 
