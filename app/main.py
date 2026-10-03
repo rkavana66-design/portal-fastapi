@@ -55,3 +55,19 @@ def temp_fix_admin_email(secret: str):
         return {"status": "Admin email updated.", "new_email": "admin@setuportal.org"}
     finally:
         db.close()
+
+
+@app.get("/api/temp-add-coding-columns/{secret}")
+def temp_add_coding_columns(secret: str):
+    if secret != "add-coding-99120":
+        return {"error": "wrong secret"}
+    from sqlalchemy import text
+    with engine.connect() as conn:
+        conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS question_type VARCHAR DEFAULT 'mcq'"))
+        conn.execute(text("ALTER TABLE questions ALTER COLUMN options DROP NOT NULL"))
+        conn.execute(text("ALTER TABLE questions ALTER COLUMN correct_option DROP NOT NULL"))
+        conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS starter_code VARCHAR"))
+        conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS language VARCHAR DEFAULT 'python'"))
+        conn.execute(text("ALTER TABLE questions ADD COLUMN IF NOT EXISTS expected_output VARCHAR"))
+        conn.commit()
+    return {"status": "coding-question columns added (or already existed) — safe, no data was touched"}
