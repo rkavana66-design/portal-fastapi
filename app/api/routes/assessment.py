@@ -14,12 +14,14 @@ from app.schemas.assessment import (
     TestCreate, TestResponse,
     TestListItem, StartAttemptResponse, QuestionForStudent,
     SubmitAttemptRequest, SubmitAttemptResponse,
+    RunCodeRequest, RunCodeResponse,
     ProctoringEventRequest, ProctoringEventResponse,
     SnapshotUploadResponse,
     AssessmentLanguageSummaryResponse,
 )
 from app.core.config import settings
 from app.utils.proctoring import record_event_and_check_disqualification
+from app.utils.code_execution import run_code, check_output_match
 from app.services.language_scores import compute_language_scores, top_language_scores
 from app.services.recommendations import generate_recommendations
 from app.schemas.recommendation import RecommendationsResponse
@@ -81,9 +83,13 @@ def create_test(
     for q in payload.questions:
         db.add(Question(
             test_id=test.id,
+            question_type=q.question_type,
             text=q.text,
             options=q.options,
             correct_option=q.correct_option,
+            starter_code=q.starter_code,
+            language=q.language,
+            expected_output=q.expected_output,
             marks=q.marks,
             order_index=q.order_index,
         ))
@@ -131,9 +137,9 @@ def start_test(
     if test is None:
         raise HTTPException(status_code=404, detail="Test not found or not active")
 
-    # Shuffle question order for this attempt, and independently shuffle each
-    # question's option order too — so the test looks different every time,
-    # without ever changing which answer is actually correct.
+    # Shuffle question order for this attempt. MCQ options are independently
+    # shuffled too; coding questions have no options to shuffle, so they're
+    # left as-is (only their position in the test changes).
     shuffled_questions = list(test.questions)
     random.shuffle(shuffled_questions)
 
@@ -142,6 +148,18 @@ def start_test(
     student_facing_questions = []
 
     for q in shuffled_questions:
+        if q.question_type == "coding":
+            student_facing_questions.append(
+                QuestionForStudent(
+                    id=q.id,
+                    question_type="coding",
+                    text=q.text,
+                    starter_code=q.starter_code,
+                    language=q.language,
+                )
+            )
+            continue
+
         # original_positions[i] tells us which ORIGINAL option index is now
         # shown at shuffled position i — this is what lets us grade correctly
         # later, no matter how the options were shuffled for this student.
@@ -151,7 +169,7 @@ def start_test(
 
         option_orders[str(q.id)] = original_positions
         student_facing_questions.append(
-            QuestionForStudent(id=q.id, text=q.text, options=shuffled_options)
+            QuestionForStudent(id=q.id, question_type="mcq", text=q.text, options=shuffled_options)
         )
 
     attempt = TestAttempt(
@@ -175,6 +193,27 @@ def start_test(
     )
 
 
+@router.post("/attempts/{attempt_id}/run-code", response_model=RunCodeResponse)
+def run_code_endpoint(
+    attempt_id: UUID,
+    payload: RunCodeRequest,
+    student: Student = Depends(get_current_student),
+    db: Session = Depends(get_db),
+):
+    """
+    Lets a student run their code and see the output WITHOUT submitting or
+    grading anything — the "Run" button while still working on the problem,
+    as opposed to final submission. Requires an active attempt so this can't
+    be used as a free-standing code playground outside a real test.
+    """
+    attempt = _get_attempt_or_404(attempt_id, student, db)
+    if attempt.status != "in_progress":
+        raise HTTPException(status_code=400, detail="This attempt is no longer in progress.")
+
+    result = run_code(payload.language, payload.code, payload.stdin or "")
+    return RunCodeResponse(**result)
+
+
 @router.post("/attempts/{attempt_id}/submit", response_model=SubmitAttemptResponse)
 def submit_attempt(
     attempt_id: UUID,
@@ -193,9 +232,11 @@ def submit_attempt(
 
     total_marks = sum(q.marks for q in questions.values())
     score = 0
+
+    # ---- Grade MCQ answers ----
     for question_id, selected_shuffled_index in payload.answers.items():
         question = questions.get(question_id)
-        if question is None:
+        if question is None or question.question_type != "mcq":
             continue
         # The student selected a position in THEIR shuffled option list —
         # translate it back to the original option index before comparing,
@@ -204,17 +245,24 @@ def submit_attempt(
         if positions and 0 <= selected_shuffled_index < len(positions):
             actual_original_index = positions[selected_shuffled_index]
         else:
-            # No shuffle recorded for this question (e.g. an older attempt
-            # from before this feature existed) — fall back to treating the
-            # answer as already being in original-option terms.
             actual_original_index = selected_shuffled_index
 
         if actual_original_index == question.correct_option:
             score += question.marks
 
+    # ---- Grade coding answers: actually run the code via Piston and compare output ----
+    for question_id, submitted_code in payload.code_answers.items():
+        question = questions.get(question_id)
+        if question is None or question.question_type != "coding":
+            continue
+        result = run_code(question.language or "python", submitted_code)
+        if result["success"] and check_output_match(result["stdout"], question.expected_output or ""):
+            score += question.marks
+
     percent = round((score / total_marks) * 100, 1) if total_marks > 0 else 0.0
 
-    attempt.answers = payload.answers
+    # Store both answer types together so the attempt record is complete.
+    attempt.answers = {**payload.answers, **{k: v for k, v in payload.code_answers.items()}}
     attempt.score = float(score)
     attempt.total_marks = float(total_marks)
     attempt.percent = percent
@@ -322,3 +370,4 @@ def get_profile_recommendations(
     scores = compute_language_scores(db, student.id)
     recommendations = generate_recommendations(scores)
     return RecommendationsResponse(recommendations=recommendations)
+
