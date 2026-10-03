@@ -7,9 +7,16 @@ from pydantic import BaseModel, Field
 
 # ---------- Admin: creating tests ----------
 class QuestionCreate(BaseModel):
+    question_type: str = "mcq"  # "mcq" | "coding"
     text: str
-    options: list[str] = Field(min_length=2)
-    correct_option: int  # index into options
+    # MCQ fields
+    options: Optional[list[str]] = None
+    correct_option: Optional[int] = None
+    # Coding fields
+    starter_code: Optional[str] = None
+    language: Optional[str] = "python"
+    expected_output: Optional[str] = None
+
     marks: int = 1
     order_index: int = 0
 
@@ -57,10 +64,13 @@ class TestListItem(BaseModel):
 
 
 class QuestionForStudent(BaseModel):
-    """Never includes correct_option — this is what the student sees while taking the test."""
+    """Never includes correct_option or expected_output — this is what the student sees while taking the test."""
     id: UUID
+    question_type: str = "mcq"
     text: str
-    options: list[str]
+    options: Optional[list[str]] = None  # only present for mcq questions
+    starter_code: Optional[str] = None  # only present for coding questions
+    language: Optional[str] = None  # only present for coding questions
 
     class Config:
         from_attributes = True
@@ -76,7 +86,8 @@ class StartAttemptResponse(BaseModel):
 
 
 class SubmitAttemptRequest(BaseModel):
-    answers: dict[str, int]  # {question_id (as string): selected_option_index}
+    answers: dict[str, int] = {}  # {question_id: selected_option_index} — mcq questions only
+    code_answers: dict[str, str] = {}  # {question_id: submitted_code} — coding questions only
 
 
 class SubmitAttemptResponse(BaseModel):
@@ -86,6 +97,19 @@ class SubmitAttemptResponse(BaseModel):
     total_marks: float
     percent: float
     passed: bool
+
+
+class RunCodeRequest(BaseModel):
+    """For the 'Run' button while taking a test — executes code without grading or saving it."""
+    language: str
+    code: str
+    stdin: Optional[str] = None
+
+
+class RunCodeResponse(BaseModel):
+    stdout: str
+    stderr: str
+    success: bool  # true if the code ran without a runtime error (NOT whether the output was "correct")
 
 
 class ProctoringEventRequest(BaseModel):
