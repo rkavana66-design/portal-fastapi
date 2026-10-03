@@ -180,9 +180,18 @@ class Question(Base):
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     test_id = Column(UUID(as_uuid=True), ForeignKey("tests.id", ondelete="CASCADE"), nullable=False, index=True)
+    question_type = Column(String, nullable=False, default="mcq")  # "mcq" | "coding"
     text = Column(String, nullable=False)
-    options = Column(JSON, nullable=False)  # list[str], e.g. ["2", "4", "6", "8"]
-    correct_option = Column(Integer, nullable=False)  # index into options — never sent to students
+
+    # MCQ-only fields — nullable, since coding questions don't use them
+    options = Column(JSON, nullable=True)  # list[str], e.g. ["2", "4", "6", "8"]
+    correct_option = Column(Integer, nullable=True)  # index into options — never sent to students
+
+    # Coding-only fields — nullable, since MCQ questions don't use them
+    starter_code = Column(String, nullable=True)  # pre-filled code shown in the editor
+    language = Column(String, nullable=True, default="python")  # Piston's language name, e.g. "python"
+    expected_output = Column(String, nullable=True)  # exact stdout expected for a correct solution
+
     marks = Column(Integer, nullable=False, default=1)
     order_index = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
