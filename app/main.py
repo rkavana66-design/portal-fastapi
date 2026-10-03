@@ -91,3 +91,26 @@ def temp_add_coding_question(secret: str):
         return {"status": "Coding question added to Python Basics."}
     finally:
         db.close()
+
+
+@app.get("/api/temp-check-questions/{secret}")
+def temp_check_questions(secret: str):
+    if secret != "check-q-30877":
+        return {"error": "wrong secret"}
+    from app.db.session import SessionLocal
+    from app.models.models import Test, Question
+
+    db = SessionLocal()
+    try:
+        tests = db.query(Test).filter(Test.title == "Python Basics").all()
+        result = []
+        for t in tests:
+            questions = db.query(Question).filter(Question.test_id == t.id).all()
+            result.append({
+                "test_id": str(t.id),
+                "question_count": len(questions),
+                "question_types": [q.question_type for q in questions],
+            })
+        return {"matching_tests": result}
+    finally:
+        db.close()
