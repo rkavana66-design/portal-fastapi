@@ -1,91 +1,104 @@
 """
-Executes student-submitted code via Piston (https://github.com/engineer-man/piston),
-a free, public code-execution API. Code runs entirely on Piston's own servers, in
-their sandbox, completely separate from this backend. This means a student's code
-(even buggy or resource-heavy code) can never affect or crash this server — a
-deliberate choice after this project's earlier experience with heavy processing
-(OCR) exceeding this server's own resources.
+Executes student-submitted Python code directly on this server, with strict
+safety limits — not a full sandbox like a dedicated execution service, but a
+deliberately constrained subprocess: a short time limit, a memory cap, no
+ability to spawn further processes, and no access to this server's own files
+or database. This is a genuine, understood tradeoff: meaningfully safer than
+running code with no limits at all, but not as strong a guarantee as an
+external, purpose-built sandbox like Piston (which, as of Feb 2026, requires
+a paid/approved key — see earlier project notes for that history).
 
-IMPORTANT, as of Feb 2026: Piston's public API is no longer freely available
-without an approved key (see https://github.com/engineer-man/piston). Until a
-paid/approved execution service is configured, run_code() below will fail
-gracefully — returning a clear, honest message rather than crashing or exposing
-a raw technical error to students. The code editor, question, and submission
-flow all still work; only the actual execution is blocked.
+Only Python is supported this way — this server doesn't have compilers/
+interpreters installed for other languages, and installing them is a bigger,
+separate decision (similar in kind to this project's earlier experience
+with heavy OCR dependencies exceeding what the free hosting tier can hold).
+
+This code deliberately avoids true exec()-in-process execution (which could
+crash or hang this entire backend on a bad script) — it always runs as a
+separate subprocess, which the OS can reliably kill if it misbehaves.
 """
 
-import httpx
+import os
+import resource
+import subprocess
+import sys
+import tempfile
 
-PISTON_API_URL = "https://emkc.org/api/v2/piston/execute"
+RUN_TIMEOUT_SECONDS = 5
+MAX_MEMORY_BYTES = 128 * 1024 * 1024  # 128 MB — enough for a short script, not for anything heavy
+MAX_CODE_LENGTH = 10_000  # characters — a sane cap for a test-question answer
 
-# Piston needs an exact (language, version) pair. "*" tells it to use whatever
-# version it currently has installed for that language — avoids this breaking
-# if Piston upgrades their runtimes later.
-LANGUAGE_VERSIONS = {
-    "python": "3.10.0",
-    "javascript": "18.15.0",
-    "java": "15.0.2",
-    "c": "10.2.0",
-    "cpp": "10.2.0",
-}
 
-RUN_TIMEOUT_SECONDS = 10  # how long we wait for Piston to respond
+def _apply_resource_limits():
+    """
+    Runs just before the subprocess's own code starts (via subprocess's
+    preexec_fn). Caps CPU time, memory, and process creation for THIS
+    subprocess only — never affects the main server process.
+    """
+    resource.setrlimit(resource.RLIMIT_CPU, (RUN_TIMEOUT_SECONDS, RUN_TIMEOUT_SECONDS))
+    resource.setrlimit(resource.RLIMIT_AS, (MAX_MEMORY_BYTES, MAX_MEMORY_BYTES))
+    # Blocks the script from spawning further processes (e.g. a fork bomb).
+    resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
 
 
 def run_code(language: str, code: str, stdin: str = "") -> dict:
     """
-    Runs `code` via Piston and returns:
+    Runs `code` and returns:
         {"stdout": str, "stderr": str, "success": bool}
 
-    success is True only if the code ran without a compile/runtime error —
-    it says nothing about whether the output was "correct" for a given
-    question; that comparison happens separately, in the caller.
+    success is True only if the code ran without a runtime error AND
+    finished within the time/memory limits — it says nothing about whether
+    the output was "correct" for a given question; that's a separate check.
     """
-    version = LANGUAGE_VERSIONS.get(language)
-    if version is None:
+    if language != "python":
         return {
             "stdout": "",
-            "stderr": f"Unsupported language: {language}",
+            "stderr": f"This server can currently only run Python code (got: {language}).",
             "success": False,
         }
 
-    file_extension = {
-        "python": "py", "javascript": "js", "java": "java", "c": "c", "cpp": "cpp",
-    }.get(language, "txt")
-
-    payload = {
-        "language": language,
-        "version": version,
-        "files": [{"name": f"main.{file_extension}", "content": code}],
-        "stdin": stdin,
-    }
-
-    try:
-        response = httpx.post(PISTON_API_URL, json=payload, timeout=RUN_TIMEOUT_SECONDS)
-        response.raise_for_status()
-        data = response.json()
-    except Exception:
-        # The public Piston API has moved to a paid/approval-only model as of
-        # Feb 2026 — this is a known, honest limitation, not a bug. Shown to
-        # the student as a clear message rather than a raw technical error.
+    if len(code) > MAX_CODE_LENGTH:
         return {
             "stdout": "",
-            "stderr": "Code execution is temporarily unavailable. Your code has been saved — please continue with the rest of the test.",
+            "stderr": "Code is too long.",
             "success": False,
         }
 
-    run_result = data.get("run", {})
-    stdout = run_result.get("stdout", "") or ""
-    stderr = run_result.get("stderr", "") or ""
-    compile_result = data.get("compile")
-    compile_failed = bool(compile_result and compile_result.get("code", 0) != 0)
+    # Write the student's code to a real temporary file rather than piping
+    # it in, so error messages/tracebacks reference a real, readable path
+    # instead of <stdin>.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        script_path = os.path.join(tmp_dir, "submission.py")
+        with open(script_path, "w") as f:
+            f.write(code)
 
-    success = not compile_failed and run_result.get("code", 1) == 0
-
-    if compile_failed:
-        stderr = (compile_result.get("stderr") or "") + stderr
-
-    return {"stdout": stdout, "stderr": stderr, "success": success}
+        try:
+            result = subprocess.run(
+                [sys.executable, script_path],
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=RUN_TIMEOUT_SECONDS,
+                cwd=tmp_dir,
+                preexec_fn=_apply_resource_limits,
+            )
+            return {
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+                "success": result.returncode == 0,
+            }
+        except subprocess.TimeoutExpired:
+            return {
+                "stdout": "",
+                "stderr": f"Code took longer than {RUN_TIMEOUT_SECONDS} seconds to run and was stopped.",
+                "success": False,
+            }
+        except Exception as e:
+            return {
+                "stdout": "",
+                "stderr": f"Could not run code: {e}",
+                "success": False,
+            }
 
 
 def check_output_match(actual_stdout: str, expected_output: str) -> bool:
