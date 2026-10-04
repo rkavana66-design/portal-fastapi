@@ -3,6 +3,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.db.session import get_db, SessionLocal
 from app.api.deps import get_current_user, require_role
@@ -177,6 +178,62 @@ def manual_verify_document(
     )
 
 
+# ---------- c0) CLIENT-SIDE OCR RESCAN ----------
+class ClientOcrRequest(BaseModel):
+    ocr_text: str
+
+
+@router.post("/document/{document_id}/client-ocr-rescan", response_model=DocumentVerificationResponse)
+def client_ocr_rescan(
+    document_id: UUID,
+    payload: ClientOcrRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-runs verification using text the STUDENT'S OWN BROWSER already
+    extracted (via Tesseract.js) from a photo/scanned certificate — covers
+    exactly the case native PDF text extraction can't handle, with zero
+    extra load on this server. The OCR work happens entirely client-side;
+    this endpoint only re-checks the resulting text against the same real
+    rules used everywhere else (name match, known issuer, design elements).
+    """
+    document = _get_document_or_404(document_id, db)
+    owner = db.query(Student).filter(Student.id == document.student_id).first()
+    account_name = owner.name if owner else None
+    account_college = owner.college if owner else None
+
+    qr_text = extract_qr_code(document.file_path)
+    qr_info = check_qr_domain(qr_text, _trusted_domains())
+    holder_info = check_certificate_holder(qr_text, account_name)
+    tamper_signals = basic_image_tamper_checks(document.file_path)
+    pdf_tool_info = check_pdf_producer_metadata(document.file_path)
+    design_info = check_pdf_has_design_elements(document.file_path)
+
+    ocr_text = (payload.ocr_text or "").strip().lower()
+    ocr_info = check_certificate_text(ocr_text if ocr_text else None, account_name, account_college)
+
+    status_value, details = compute_verification_status(
+        qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
+        ocr_info=ocr_info, pdf_tool_info=pdf_tool_info, design_info=design_info,
+    )
+    details["ocr_source"] = "client_side_tesseract"
+
+    document.verification_status = status_value
+    document.verification_details = details
+    db.commit()
+    db.refresh(document)
+
+    return DocumentVerificationResponse(
+        id=document.id,
+        type=document.type,
+        file_path=document.file_path,
+        verification_status=document.verification_status,
+        verification_details=document.verification_details,
+        message="Re-scanned using text extracted in your browser.",
+    )
+
+
 # ---------- c) GET VERIFICATION STATUS ----------
 @router.get("/document/{document_id}/verification", response_model=DocumentVerificationResponse)
 def get_document_verification(
@@ -211,8 +268,6 @@ def list_all_documents(
             relative = Path(file_path).relative_to(upload_root).as_posix()
             return f"{BACKEND_BASE_URL}/uploads/{relative}"
         except ValueError:
-            # Fallback: file_path wasn't under upload_root for some reason —
-            # better to show something than crash the whole list.
             return file_path
 
     return [
@@ -245,7 +300,6 @@ def verify_external_profiles(
     linkedin_result = verify_linkedin_profile(student.linkedin_url)
     portfolio_result = verify_portfolio_url(student.portfolio_url)
 
-    # Persist what we learned back onto the student record
     if github_result["github_verified"]:
         student.github_username = github_result["github_username"]
     if leetcode_result["leetcode_verified"]:
