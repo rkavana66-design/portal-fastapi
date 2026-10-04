@@ -70,7 +70,7 @@ def get_profile(
         user_id=student.user_id,
         name=student.name,
         discipline=student.discipline,
-        college=None,
+        college=student.college,
         year_of_study=None,
         cgpa=None,
         github_url=student.github_url,
@@ -90,13 +90,17 @@ def get_profile(
     )
 
 
-# ---------- a2) UPDATE EXTERNAL PROFILE LINKS ----------
+# ---------- a2) UPDATE EXTERNAL PROFILE LINKS (and college) ----------
 @router.put("/profile/external", response_model=StudentProfileResponse)
 def update_external_profiles(
     payload: UpdateExternalProfilesRequest,
     student: Student = Depends(get_current_student),
     db: Session = Depends(get_db),
 ):
+    if payload.college is not None:
+        # Empty/whitespace-only input clears the field rather than saving a
+        # blank string that would never match anything on a certificate.
+        student.college = payload.college.strip() or None
     if payload.github_url is not None:
         student.github_url = payload.github_url
     if payload.linkedin_url is not None:
@@ -117,7 +121,7 @@ def update_external_profiles(
         user_id=student.user_id,
         name=student.name,
         discipline=student.discipline,
-        college=None,
+        college=student.college,
         year_of_study=None,
         cgpa=None,
         github_url=student.github_url,
