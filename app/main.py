@@ -1,11 +1,17 @@
+import os
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.db.session import Base, engine
+from app.db.session import Base, engine, SessionLocal
 from app.models import models  # noqa: F401 — ensures models are registered before create_all
+from app.models.models import User, UserRole
 from app.api.routes import auth, examples, student, verification, assessment, recruiter, insights
 from app.core.config import settings
+from app.core.security import hash_password
+
+ADMIN_EMAIL = "admin@setuportal.org"
 
 app = FastAPI(title="Placement Portal — Auth Service")
 
@@ -21,7 +27,7 @@ app.add_middleware(
 # Switch to Alembic migrations (`alembic upgrade head`) once the schema stabilizes.
 Base.metadata.create_all(bind=engine)
 
-# Serves uploaded files (currently: profile photos) at http://127.0.0.1:8000/uploads/...
+# Serves uploaded files (profile photos, certificates) at /uploads/...
 app.mount("/uploads", StaticFiles(directory=settings.upload_dir), name="uploads")
 
 app.include_router(auth.router)
@@ -33,84 +39,53 @@ app.include_router(recruiter.router)
 app.include_router(insights.router)
 
 
+@app.on_event("startup")
+def one_time_setup_from_env():
+    """
+    One-time setup driven by environment variables, so secrets never appear in
+    code or chat. Set the variables on Render, let the service restart, check
+    the logs, then DELETE the variables.
+
+    ADMIN_NEW_PASSWORD (min 12 characters): creates the admin account if it
+        doesn't exist, or changes its password if it does.
+    SEED_ASSESSMENT_DATA=1: loads the sample assessment tests. Safe to repeat;
+        tests that already exist are skipped.
+    """
+    new_password = os.environ.get("ADMIN_NEW_PASSWORD")
+    if new_password:
+        if len(new_password) < 12:
+            print("ADMIN_NEW_PASSWORD ignored: it must be at least 12 characters.", flush=True)
+        else:
+            db = SessionLocal()
+            try:
+                admin_user = db.query(User).filter(User.email == ADMIN_EMAIL).first()
+                if admin_user is None:
+                    db.add(User(
+                        email=ADMIN_EMAIL,
+                        password_hash=hash_password(new_password),
+                        role=UserRole.admin,
+                        is_verified=True,
+                    ))
+                    db.commit()
+                    print("Admin account created. Now delete ADMIN_NEW_PASSWORD on Render.", flush=True)
+                elif admin_user.role == UserRole.admin:
+                    admin_user.password_hash = hash_password(new_password)
+                    db.commit()
+                    print("Admin password updated. Now delete ADMIN_NEW_PASSWORD on Render.", flush=True)
+                else:
+                    print("ADMIN_NEW_PASSWORD ignored: that email belongs to a non-admin account.", flush=True)
+            finally:
+                db.close()
+
+    if os.environ.get("SEED_ASSESSMENT_DATA") == "1":
+        try:
+            from scripts.seed_assessment_data import seed
+            seed()
+            print("Assessment tests loaded. Now delete SEED_ASSESSMENT_DATA on Render.", flush=True)
+        except Exception as e:
+            print(f"Seeding failed: {e}", flush=True)
+
+
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
-
-
-@app.get("/api/temp-fix-admin-email/{secret}")
-def temp_fix_admin_email(secret: str):
-    if secret != "fix-admin-55512":
-        return {"error": "wrong secret"}
-    from app.db.session import SessionLocal
-    from app.models.models import User
-
-    db = SessionLocal()
-    try:
-        admin_user = db.query(User).filter(User.email == "admin@setu.local").first()
-        if admin_user is None:
-            return {"error": "No admin account found with the old email."}
-        admin_user.email = "admin@setuportal.org"
-        db.commit()
-        return {"status": "Admin email updated.", "new_email": "admin@setuportal.org"}
-    finally:
-        db.close()
-
-
-@app.get("/api/temp-add-coding-question/{secret}")
-def temp_add_coding_question(secret: str):
-    if secret != "add-coding-q-45190":
-        return {"error": "wrong secret"}
-    from app.db.session import SessionLocal
-    from app.models.models import Test, Question
-
-    db = SessionLocal()
-    try:
-        test = db.query(Test).filter(Test.title == "Python Basics").first()
-        if test is None:
-            return {"error": "Python Basics test not found — seed assessment data first."}
-
-        existing = db.query(Question).filter(
-            Question.test_id == test.id, Question.question_type == "coding"
-        ).first()
-        if existing:
-            return {"status": "A coding question already exists on this test."}
-
-        question = Question(
-            test_id=test.id,
-            question_type="coding",
-            text="Write a function that prints the sum of 2 and 3. Your program should print only the number 5.",
-            starter_code="# Write your code below\nprint(2 + 3)\n",
-            language="python",
-            expected_output="5",
-            marks=5,
-            order_index=99,
-        )
-        db.add(question)
-        db.commit()
-        return {"status": "Coding question added to Python Basics."}
-    finally:
-        db.close()
-
-
-@app.get("/api/temp-check-questions/{secret}")
-def temp_check_questions(secret: str):
-    if secret != "check-q-30877":
-        return {"error": "wrong secret"}
-    from app.db.session import SessionLocal
-    from app.models.models import Test, Question
-
-    db = SessionLocal()
-    try:
-        tests = db.query(Test).filter(Test.title == "Python Basics").all()
-        result = []
-        for t in tests:
-            questions = db.query(Question).filter(Question.test_id == t.id).all()
-            result.append({
-                "test_id": str(t.id),
-                "question_count": len(questions),
-                "question_types": [q.question_type for q in questions],
-            })
-        return {"matching_tests": result}
-    finally:
-        db.close()
