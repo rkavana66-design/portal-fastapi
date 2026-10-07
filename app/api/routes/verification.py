@@ -28,9 +28,7 @@ router = APIRouter(prefix="/api/verification", tags=["verification"])
 
 # Your backend's real, public address — needed to build a URL the admin's
 # browser can actually open, since file_path is just a local disk path on
-# the server. (Mirrors the same pattern used for profile photos in
-# app/api/routes/student.py, which is hardcoded to localhost there — a
-# good thing to fix there too, later.)
+# the server.
 BACKEND_BASE_URL = "https://portal-fastapi.onrender.com"
 
 
@@ -45,6 +43,19 @@ def _get_document_or_404(document_id: UUID, db: Session) -> Document:
     return document
 
 
+def _ensure_can_access(document: Document, current_user: User, db: Session) -> None:
+    """
+    A document can only be scanned or inspected by the student who owns it,
+    or by an admin. Without this, any logged-in user who learned a document's
+    ID could read or re-scan someone else's certificate.
+    """
+    if current_user.role == UserRole.admin:
+        return
+    owner = db.query(Student).filter(Student.id == document.student_id).first()
+    if owner is None or owner.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This is not your document.")
+
+
 # ---------- Background worker: does the actual (slow) scanning work ----------
 def _run_document_scan(document_id: UUID) -> None:
     """
@@ -53,13 +64,8 @@ def _run_document_scan(document_id: UUID) -> None:
     has already been sent — so it needs its own database session, since the
     request's session closes as soon as the response goes out.
 
-    This exists specifically because OCR (EasyOCR/PyTorch, used only as a
-    last-resort fallback below) can take anywhere from a few seconds to a few
-    minutes on its first run. Making the student's browser wait synchronously
-    for that risks a real timeout on most hosting platforms (many kill
-    requests around 30 seconds) — so the upload returns instantly with
-    "pending", and this function updates the real result a bit later. The
-    frontend polls for it.
+    The upload returns instantly with "pending", and this function updates
+    the real result a bit later. The frontend polls for it.
     """
     db = SessionLocal()
     try:
@@ -121,10 +127,11 @@ def _run_document_scan(document_id: UUID) -> None:
 def scan_document(
     document_id: UUID,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),  # any logged-in user for now, per spec
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
 
     if not document.file_path:
         raise HTTPException(status_code=400, detail="Document has no file on disk to scan")
@@ -155,7 +162,7 @@ def scan_document(
 def manual_verify_document(
     document_id: UUID,
     payload: ManualVerifyRequest,
-    current_user: User = Depends(require_role(UserRole.admin)),  # tighten/loosen for your demo as needed
+    current_user: User = Depends(require_role(UserRole.admin)),
     db: Session = Depends(get_db),
 ):
     document = _get_document_or_404(document_id, db)
@@ -194,11 +201,16 @@ def client_ocr_rescan(
     Re-runs verification using text the STUDENT'S OWN BROWSER already
     extracted (via Tesseract.js) from a photo/scanned certificate — covers
     exactly the case native PDF text extraction can't handle, with zero
-    extra load on this server. The OCR work happens entirely client-side;
-    this endpoint only re-checks the resulting text against the same real
-    rules used everywhere else (name match, known issuer, design elements).
+    extra load on this server.
+
+    IMPORTANT: because the text comes from the student's own browser, this
+    server cannot prove it was really read from the uploaded file. So a
+    text-only match is never auto-verified — it is sent to an admin for
+    one-click confirmation instead.
     """
     document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
+
     owner = db.query(Student).filter(Student.id == document.student_id).first()
     account_name = owner.name if owner else None
     account_college = owner.college if owner else None
@@ -218,6 +230,12 @@ def client_ocr_rescan(
         ocr_info=ocr_info, pdf_tool_info=pdf_tool_info, design_info=design_info,
     )
     details["ocr_source"] = "client_side_tesseract"
+
+    # Text from the browser can't be proven genuine, so without a trusted QR
+    # code a "verified" result waits for an admin instead of passing outright.
+    if status_value == "verified" and not qr_info.get("qr_found"):
+        status_value = "pending"
+        details["notes"] = (details.get("notes") or "") + " Awaiting admin confirmation."
 
     document.verification_status = status_value
     document.verification_details = details
@@ -242,6 +260,7 @@ def get_document_verification(
     db: Session = Depends(get_db),
 ):
     document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
     return DocumentVerificationResponse(
         id=document.id,
         type=document.type,
