@@ -1,21 +1,23 @@
 """
-Executes student-submitted Python code directly on this server, with strict
-safety limits — not a full sandbox like a dedicated execution service, but a
-deliberately constrained subprocess: a short time limit, a memory cap, no
-ability to spawn further processes, and no access to this server's own files
-or database. This is a genuine, understood tradeoff: meaningfully safer than
-running code with no limits at all, but not as strong a guarantee as an
-external, purpose-built sandbox like Piston (which, as of Feb 2026, requires
-a paid/approved key — see earlier project notes for that history).
+Executes student-submitted Python code directly on this server.
 
-Only Python is supported this way — this server doesn't have compilers/
-interpreters installed for other languages, and installing them is a bigger,
-separate decision (similar in kind to this project's earlier experience
-with heavy OCR dependencies exceeding what the free hosting tier can hold).
+HONEST LIMITS — read before relying on this:
+- The code runs as a separate subprocess with a time limit, a memory cap,
+  and a block on spawning further processes. That stops runaway or
+  fork-bomb style code from hanging or crashing the backend.
+- It runs with an EMPTY environment, so it cannot read this server's
+  secrets (database URL, JWT secret, API keys) from environment variables,
+  and in Python's isolated mode (-I) so it ignores PYTHON* settings.
+- It is NOT a real sandbox. The code still runs as the same operating-system
+  user on the same machine, so it can read files on disk, including other
+  students' uploaded documents and this application's source code. Closing
+  that needs real isolation (a container or a dedicated execution service).
+  Do not treat this as safe for untrusted strangers once real users have
+  uploaded documents.
 
-This code deliberately avoids true exec()-in-process execution (which could
-crash or hang this entire backend on a bad script) — it always runs as a
-separate subprocess, which the OS can reliably kill if it misbehaves.
+Only Python is supported — this server has no other interpreters installed.
+It always runs as a separate subprocess (never exec() in-process), which the
+OS can reliably kill if it misbehaves.
 """
 
 import os
@@ -27,6 +29,10 @@ import tempfile
 RUN_TIMEOUT_SECONDS = 5
 MAX_MEMORY_BYTES = 128 * 1024 * 1024  # 128 MB — enough for a short script, not for anything heavy
 MAX_CODE_LENGTH = 10_000  # characters — a sane cap for a test-question answer
+
+# The ONLY environment the student's code gets. Deliberately tiny: no
+# DATABASE_URL, JWT_SECRET, RESEND_API_KEY, SMTP_PASS or anything else.
+SAFE_ENV = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
 
 
 def _apply_resource_limits():
@@ -74,12 +80,13 @@ def run_code(language: str, code: str, stdin: str = "") -> dict:
 
         try:
             result = subprocess.run(
-                [sys.executable, script_path],
+                [sys.executable, "-I", script_path],
                 input=stdin,
                 capture_output=True,
                 text=True,
                 timeout=RUN_TIMEOUT_SECONDS,
                 cwd=tmp_dir,
+                env=SAFE_ENV,
                 preexec_fn=_apply_resource_limits,
             )
             return {
