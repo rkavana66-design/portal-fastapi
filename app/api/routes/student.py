@@ -28,10 +28,9 @@ ALLOWED_DOC_TYPES = {"certificate", "internship", "other"}
 
 MAX_PHOTO_SIZE = 5 * 1024 * 1024  # 5 MB
 ALLOWED_PHOTO_TYPES = {"image/jpeg", "image/png"}
-# Hardcoded to match this project's fixed local dev setup (same base URL
-# used everywhere else in this app, e.g. lib/api.ts's BASE_URL on the
-# frontend). Move to settings if you ever deploy somewhere else.
-BACKEND_BASE_URL = "http://127.0.0.1:8000"
+# Public address of this backend, used to build photo links that users'
+# browsers can actually open.
+BACKEND_BASE_URL = "https://portal-fastapi.onrender.com"
 
 
 def _photo_url(student: Student) -> str | None:
