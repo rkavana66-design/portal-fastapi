@@ -17,7 +17,9 @@ from app.core.config import settings
 router = APIRouter(prefix="/api/recruiter", tags=["recruiter"])
 
 UPLOAD_ROOT = Path(settings.upload_dir)
-BACKEND_BASE_URL = "http://127.0.0.1:8000"  # matches student.py — fixed local dev setup
+# Public address of this backend, used to build photo links that users'
+# browsers can actually open.
+BACKEND_BASE_URL = "https://portal-fastapi.onrender.com"
 
 
 def _photo_url(student: Student) -> str | None:
@@ -114,7 +116,7 @@ def get_candidate_resume(
         user_id=student.user_id,
         name=student.name,
         discipline=student.discipline,
-        college=None,
+        college=student.college,
         year_of_study=None,
         cgpa=None,
         github_url=student.github_url,
