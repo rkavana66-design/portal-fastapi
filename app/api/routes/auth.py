@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
@@ -13,6 +13,7 @@ from app.core.security import (
     hash_password, verify_password, create_access_token,
     generate_raw_token, hash_token,
 )
+from app.core.rate_limit import limiter, client_ip
 from app.utils.email import send_email, verification_email_html, reset_password_email_html
 from app.core.config import settings
 
@@ -39,7 +40,9 @@ def _create_verification_token(db: Session, user: User, purpose: str, hours: int
 
 # ---------- SIGNUP ----------
 @router.post("/signup", response_model=MessageResponse, status_code=status.HTTP_201_CREATED)
-def signup(payload: SignupRequest, db: Session = Depends(get_db)):
+def signup(payload: SignupRequest, request: Request, db: Session = Depends(get_db)):
+    limiter.check(f"signup:{client_ip(request)}", 5, 3600)
+
     domain = payload.email.split("@")[1].lower()
 
     if payload.role == UserRole.recruiter and domain in FREE_EMAIL_DOMAINS:
@@ -65,8 +68,6 @@ def signup(payload: SignupRequest, db: Session = Depends(get_db)):
     elif payload.role == UserRole.recruiter:
         org = db.query(RecruiterOrg).filter(RecruiterOrg.domain == domain).first()
         if org is None:
-            # Auto-create an org record from the domain for demo purposes.
-            # In production you'd likely require pre-registered/approved orgs instead.
             org = RecruiterOrg(name=domain.split(".")[0].title(), domain=domain)
             db.add(org)
             db.flush()
@@ -109,9 +110,13 @@ def verify_email(token: str, db: Session = Depends(get_db)):
 
 # ---------- RESEND VERIFICATION ----------
 @router.post("/resend-verification", response_model=MessageResponse)
-def resend_verification(payload: ResendVerificationRequest, db: Session = Depends(get_db)):
+def resend_verification(payload: ResendVerificationRequest, request: Request, db: Session = Depends(get_db)):
+    email = payload.email.lower()
+    limiter.check(f"resend:{client_ip(request)}", 5, 3600)
+    limiter.check(f"resend-email:{email}", 3, 3600)
+
     generic = MessageResponse(message="If that account exists and is unverified, a new link was sent.")
-    user = db.query(User).filter(User.email == payload.email.lower()).first()
+    user = db.query(User).filter(User.email == email).first()
     if user is None or user.is_verified:
         return generic
 
@@ -124,13 +129,19 @@ def resend_verification(payload: ResendVerificationRequest, db: Session = Depend
 
 # ---------- LOGIN ----------
 @router.post("/login", response_model=TokenResponse)
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == payload.email.lower()).first()
+def login(payload: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    email = payload.email.lower()
+    limiter.check(f"login-email:{email}", 8, 900)
+    limiter.check(f"login-ip:{client_ip(request)}", 40, 900)
+
+    user = db.query(User).filter(User.email == email).first()
     if user is None or not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
     if not user.is_verified:
         raise HTTPException(status_code=403, detail="Please verify your email before logging in.")
+
+    limiter.reset(f"login-email:{email}")
 
     name = user.student.name if user.student else (user.recruiter.name if user.recruiter else "")
     token = create_access_token({"sub": str(user.id), "role": user.role.value, "email": user.email})
@@ -140,9 +151,13 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
 
 # ---------- FORGOT PASSWORD ----------
 @router.post("/forgot-password", response_model=MessageResponse)
-def forgot_password(payload: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def forgot_password(payload: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
+    email = payload.email.lower()
+    limiter.check(f"forgot:{client_ip(request)}", 5, 3600)
+    limiter.check(f"forgot-email:{email}", 3, 3600)
+
     generic = MessageResponse(message="If that email is registered, a reset link has been sent.")
-    user = db.query(User).filter(User.email == payload.email.lower()).first()
+    user = db.query(User).filter(User.email == email).first()
     if user is None:
         return generic
 
@@ -176,3 +191,4 @@ def reset_password(token: str, payload: ResetPasswordRequest, db: Session = Depe
     db.commit()
 
     return MessageResponse(message="Password updated. You can now log in with your new password.")
+    
