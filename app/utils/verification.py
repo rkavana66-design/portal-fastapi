@@ -1,134 +1,352 @@
-# ---------- d) Compute overall status ----------
-def compute_verification_status(
-    qr_info: dict,
-    tamper_signals: dict,
-    holder_info: Optional[dict] = None,
-    ocr_info: Optional[dict] = None,
-    pdf_tool_info: Optional[dict] = None,
-    design_info: Optional[dict] = None,
-) -> tuple[str, dict]:
+from uuid import UUID
+from pathlib import Path
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+from pydantic import BaseModel
+
+from app.db.session import get_db, SessionLocal
+from app.api.deps import get_current_user, require_role
+from app.models.models import User, UserRole, Document, Student
+from app.schemas.verification import (
+    DocumentVerificationResponse, ManualVerifyRequest, AdminDocumentListItem,
+    ExternalProfileVerificationResponse, GithubVerification, LeetcodeVerification,
+    LinkedinVerification, PortfolioVerification,
+)
+from app.utils.verification import (
+    extract_qr_code, check_qr_domain, check_certificate_holder, basic_image_tamper_checks,
+    extract_certificate_text, extract_certificate_text_native, check_certificate_text,
+    check_pdf_producer_metadata, check_pdf_has_design_elements, compute_verification_status,
+    ai_review_certificate, apply_ai_review,
+)
+from app.utils.external_verification import (
+    verify_github_profile, verify_leetcode_profile,
+    verify_linkedin_profile, verify_portfolio_url,
+)
+from app.core.config import settings
+
+router = APIRouter(prefix="/api/verification", tags=["verification"])
+
+# Your backend's real, public address — needed to build a URL the admin's
+# browser can actually open, since file_path is just a local disk path on
+# the server.
+BACKEND_BASE_URL = "https://portal-fastapi.onrender.com"
+
+
+def _trusted_domains() -> list[str]:
+    return [d.strip() for d in settings.trusted_issuer_domains.split(",") if d.strip()]
+
+
+def _get_document_or_404(document_id: UUID, db: Session) -> Document:
+    document = db.query(Document).filter(Document.id == document_id).first()
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return document
+
+
+def _ensure_can_access(document: Document, current_user: User, db: Session) -> None:
     """
-    Simple, explainable rule set:
-
-    - QR found + trusted domain + name matches (or nothing to check) + no
-      editing-software hint -> "verified"
-    - QR found + trusted domain, but name does NOT match -> "suspicious"
-    - No QR, text shows the student's name AND a recognized issuer, with real
-      design elements and no editing-software hint -> "verified" (text match)
-    - No QR, text matches but NO design elements -> "suspicious"
-    - No QR and the file is a photo/scan whose text could not be read ->
-      "pending" (an admin reviews it)
-    - No QR, name found but issuer not on the recognized list (for example a
-      college hackathon) -> "pending" (an admin reviews it)
-    - No QR, text readable but the student's name is not on it -> "suspicious"
-    - Editing-software hint combined with a missing/untrusted QR -> "rejected"
-    - No QR detection method available at all -> "pending"
+    A document can only be scanned or inspected by the student who owns it,
+    or by an admin. Without this, any logged-in user who learned a document's
+    ID could read or re-scan someone else's certificate.
     """
-    holder_info = holder_info or {"qr_name": None, "name_match": None}
-    ocr_info = ocr_info or {"name_found": None, "issuer_found": None}
-    pdf_tool_info = pdf_tool_info or {"pdf_tool_found": None}
-    design_info = design_info or {"has_images": None}
+    if current_user.role == UserRole.admin:
+        return
+    owner = db.query(Student).filter(Student.id == document.student_id).first()
+    if owner is None or owner.user_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This is not your document.")
 
-    if not HAS_QR_CAPABILITY:
-        return "pending", {
-            "qr_found": False,
-            "qr_domain": None,
-            "domain_trusted": None,
-            "qr_name": None,
-            "name_match": None,
-            "ocr_name_found": None,
-            "ocr_issuer_found": None,
-            "tamper_signals": tamper_signals,
-            "pdf_tool_found": None,
-            "notes": "QR detection is unavailable on this server, so authenticity could not be automatically checked. Queued for manual review.",
-        }
 
-    qr_found = qr_info.get("qr_found", False)
-    qr_domain = qr_info.get("qr_domain")
-    domain_trusted = qr_info.get("domain_trusted")
-    qr_name = holder_info.get("qr_name")
-    name_match = holder_info.get("name_match")
-    ocr_name_found = ocr_info.get("name_found")
-    ocr_issuer_found = ocr_info.get("issuer_found")
-    pdf_tool_found = pdf_tool_info.get("pdf_tool_found")
-    has_images = design_info.get("has_images")
+# ---------- Background worker: does the actual (slow) scanning work ----------
+def _run_document_scan(document_id: UUID) -> None:
+    """
+    Runs the full QR + text + tamper analysis and writes the final result to
+    the database. Executes in a background task, AFTER the HTTP response
+    has already been sent — so it needs its own database session, since the
+    request's session closes as soon as the response goes out.
 
-    editing_software_hint = False
-    software = (tamper_signals.get("exif_software") or "").lower()
-    if any(tool in software for tool in ["photoshop", "gimp", "canva"]):
-        editing_software_hint = True
-    if pdf_tool_found:
-        editing_software_hint = True
+    The upload returns instantly with "pending", and this function updates
+    the real result a bit later. The frontend polls for it.
+    """
+    db = SessionLocal()
+    try:
+        document = db.query(Document).filter(Document.id == document_id).first()
+        if document is None or not document.file_path:
+            return
 
-    qr_problem = (not qr_found) or (domain_trusted is False)
-    name_problem = name_match is False
-    ocr_confident_match = bool(ocr_name_found) and bool(ocr_issuer_found)
+        owner = db.query(Student).filter(Student.id == document.student_id).first()
+        account_name = owner.name if owner else None
 
-    if editing_software_hint and qr_problem:
-        status = "rejected"
-        tool_name = tamper_signals.get("exif_software") or pdf_tool_found
-        notes = (f"This document appears to have been made with {tool_name} "
-                 "AND has no trustworthy QR code — flagged for rejection, but a human should confirm.")
-    elif qr_found and domain_trusted and name_problem:
-        status = "suspicious"
-        notes = (f"QR code is from a trusted issuer, but the certificate holder name "
-                 f"(\"{qr_name}\") doesn't match this account — this certificate may not belong to you.")
-    elif qr_found and domain_trusted and not editing_software_hint:
-        status = "verified"
-        notes = "QR code found and matches a trusted issuer domain. No obvious editing signals detected."
-    elif not qr_found and ocr_confident_match and not editing_software_hint and has_images:
-        status = "verified"
-        notes = (f"No QR code found, but the certificate text matches your account name, names "
-                 f"a recognized issuer (\"{ocr_issuer_found}\"), and includes real design elements "
-                 f"(logo/seal/graphics). Note: this is a text-based match, not a cryptographic one — "
-                 f"weaker evidence than a verified QR code, but a real signal for certificates that "
-                 f"don't include a QR code at all.")
-    elif not qr_found and ocr_confident_match and not editing_software_hint and has_images is False:
-        status = "suspicious"
-        notes = (f"The certificate text names you and a recognized issuer (\"{ocr_issuer_found}\"), "
-                 f"but the document has no logo, seal, or design elements at all — unusual for a real "
-                 f"certificate and worth a manual check.")
-    elif not qr_found:
-        if pdf_tool_found:
-            status = "suspicious"
-            notes = f"No QR code detected, and this PDF's metadata indicates it was made with {pdf_tool_found.title()} — a design tool, not a certificate issuer."
-        elif ocr_name_found is None:
-            status = "pending"
-            notes = "No QR code found, and this looks like a photo or scan whose text could not be read automatically. Sent to an admin for review."
-        elif not ocr_name_found:
-            status = "suspicious"
-            notes = "No QR code detected, and the certificate text doesn't appear to include your account name."
-        elif not ocr_issuer_found:
-            status = "pending"
-            notes = "No QR code found. Your name appears on the certificate, but the issuer isn't on the recognized list (for example a college event). Sent to an admin for review."
-        else:
-            status = "pending"
-            notes = "No QR code found. Your name and issuer appear on the certificate, but it could not be fully confirmed automatically. Sent to an admin for review."
-    elif qr_found and domain_trusted is False:
-        status = "suspicious"
-        notes = "QR code found, but its domain doesn't match any trusted issuer — flagged for manual review."
-    elif qr_found and domain_trusted is None:
-        status = "suspicious"
-        notes = "QR code found, but no trusted-domain list was configured to check it against."
-    elif editing_software_hint:
-        status = "suspicious"
-        tool_name = tamper_signals.get("exif_software") or pdf_tool_found
-        notes = f"This document's metadata indicates it may have been made with {tool_name}."
-    else:
-        status = "suspicious"
-        notes = "Could not fully confirm authenticity — flagged for manual review."
+        qr_text = extract_qr_code(document.file_path)
+        qr_info = check_qr_domain(qr_text, _trusted_domains())
+        holder_info = check_certificate_holder(qr_text, account_name)
+        tamper_signals = basic_image_tamper_checks(document.file_path)
+        pdf_tool_info = check_pdf_producer_metadata(document.file_path)
+        design_info = check_pdf_has_design_elements(document.file_path)
 
-    details = {
-        "qr_found": bool(qr_found),
-        "qr_domain": qr_domain,
-        "domain_trusted": domain_trusted,
-        "qr_name": qr_name,
-        "name_match": name_match,
-        "ocr_name_found": ocr_name_found,
-        "ocr_issuer_found": ocr_issuer_found,
-        "tamper_signals": tamper_signals,
-        "pdf_tool_found": pdf_tool_found,
-        "has_images": has_images,
-        "notes": notes,
-    }
-    return status, details
+        ocr_info = None
+        if not qr_info.get("qr_found"):
+            # Prefer reading the PDF's real embedded text (free, instant,
+            # works for anything digitally generated) — only fall back to
+            # OCR for genuinely image-only PDFs, like a scanned paper.
+            text = extract_certificate_text_native(document.file_path)
+            if text is None:
+                text = extract_certificate_text(document.file_path)
+            ocr_info = check_certificate_text(text, account_name, owner.college if owner else None)
+
+        status_value, details = compute_verification_status(
+            qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
+            ocr_info=ocr_info, pdf_tool_info=pdf_tool_info, design_info=design_info,
+        )
+
+        # AI review: only for certificates with no QR code (photos / scans).
+        # QR-verified certificates are never touched by this step.
+        if not qr_info.get("qr_found"):
+            ai_result = ai_review_certificate(
+                document.file_path, account_name, owner.college if owner else None
+            )
+            status_value, details = apply_ai_review(status_value, details, ai_result, account_name)
+
+        document.verification_status = status_value
+        document.verification_details = details
+        document.qr_found = qr_info["qr_found"]
+        document.qr_domain = qr_info["qr_domain"]
+        db.commit()
+    except Exception as e:
+        # Never let a scanning failure crash silently with no trace — mark
+        # the document as pending-for-manual-review rather than leaving it
+        # stuck on whatever status it had before, and log the real error.
+        print(f"[VERIFICATION] Background scan failed for document {document_id}: {e}")
+        try:
+            document = db.query(Document).filter(Document.id == document_id).first()
+            if document is not None:
+                document.verification_status = "pending"
+                document.verification_details = {
+                    "notes": "Automatic scan failed unexpectedly — queued for manual review."
+                }
+                db.commit()
+        except Exception:
+            pass
+    finally:
+        db.close()
+
+
+# ---------- a) SCAN DOCUMENT ----------
+@router.post("/scan-document/{document_id}", response_model=DocumentVerificationResponse)
+def scan_document(
+    document_id: UUID,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
+
+    if not document.file_path:
+        raise HTTPException(status_code=400, detail="Document has no file on disk to scan")
+
+    # Return immediately — the actual scan (which can take anywhere from a
+    # couple seconds to a couple minutes, especially with OCR involved) runs
+    # in the background. The frontend should poll
+    # GET /document/{id}/verification until the status is no longer "pending".
+    document.verification_status = "pending"
+    document.verification_details = {"notes": "Scan in progress…"}
+    db.commit()
+    db.refresh(document)
+
+    background_tasks.add_task(_run_document_scan, document.id)
+
+    return DocumentVerificationResponse(
+        id=document.id,
+        type=document.type,
+        file_path=document.file_path,
+        verification_status=document.verification_status,
+        verification_details=document.verification_details,
+        message="Scan started — check back shortly for the result.",
+    )
+
+
+# ---------- b) MANUAL OVERRIDE ----------
+@router.post("/manual-verify-document/{document_id}", response_model=DocumentVerificationResponse)
+def manual_verify_document(
+    document_id: UUID,
+    payload: ManualVerifyRequest,
+    current_user: User = Depends(require_role(UserRole.admin)),
+    db: Session = Depends(get_db),
+):
+    document = _get_document_or_404(document_id, db)
+
+    document.verification_status = payload.status
+    details = document.verification_details or {}
+    details["manual_notes"] = payload.notes
+    details["manually_reviewed_by"] = str(current_user.id)
+    document.verification_details = details
+    db.commit()
+    db.refresh(document)
+
+    return DocumentVerificationResponse(
+        id=document.id,
+        type=document.type,
+        file_path=document.file_path,
+        verification_status=document.verification_status,
+        verification_details=document.verification_details,
+        message="Manual verification recorded.",
+    )
+
+
+# ---------- c0) CLIENT-SIDE OCR RESCAN ----------
+class ClientOcrRequest(BaseModel):
+    ocr_text: str
+
+
+@router.post("/document/{document_id}/client-ocr-rescan", response_model=DocumentVerificationResponse)
+def client_ocr_rescan(
+    document_id: UUID,
+    payload: ClientOcrRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Re-runs verification using text the STUDENT'S OWN BROWSER already
+    extracted (via Tesseract.js) from a photo/scanned certificate — covers
+    exactly the case native PDF text extraction can't handle, with zero
+    extra load on this server.
+
+    IMPORTANT: because the text comes from the student's own browser, this
+    server cannot prove it was really read from the uploaded file. So a
+    text-only match is never auto-verified — it is sent to an admin for
+    one-click confirmation instead.
+    """
+    document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
+
+    owner = db.query(Student).filter(Student.id == document.student_id).first()
+    account_name = owner.name if owner else None
+    account_college = owner.college if owner else None
+
+    qr_text = extract_qr_code(document.file_path)
+    qr_info = check_qr_domain(qr_text, _trusted_domains())
+    holder_info = check_certificate_holder(qr_text, account_name)
+    tamper_signals = basic_image_tamper_checks(document.file_path)
+    pdf_tool_info = check_pdf_producer_metadata(document.file_path)
+    design_info = check_pdf_has_design_elements(document.file_path)
+
+    ocr_text = (payload.ocr_text or "").strip().lower()
+    ocr_info = check_certificate_text(ocr_text if ocr_text else None, account_name, account_college)
+
+    status_value, details = compute_verification_status(
+        qr_info=qr_info, tamper_signals=tamper_signals, holder_info=holder_info,
+        ocr_info=ocr_info, pdf_tool_info=pdf_tool_info, design_info=design_info,
+    )
+    details["ocr_source"] = "client_side_tesseract"
+
+    # Text from the browser can't be proven genuine, so without a trusted QR
+    # code a "verified" result waits for an admin instead of passing outright.
+    if status_value == "verified" and not qr_info.get("qr_found"):
+        status_value = "pending"
+        details["notes"] = (details.get("notes") or "") + " Awaiting admin confirmation."
+
+    # AI review also runs here for certificates without a QR code, since the
+    # AI reads the uploaded file itself rather than text sent by the browser.
+    if not qr_info.get("qr_found"):
+        ai_result = ai_review_certificate(document.file_path, account_name, account_college)
+        status_value, details = apply_ai_review(status_value, details, ai_result, account_name)
+
+    document.verification_status = status_value
+    document.verification_details = details
+    db.commit()
+    db.refresh(document)
+
+    return DocumentVerificationResponse(
+        id=document.id,
+        type=document.type,
+        file_path=document.file_path,
+        verification_status=document.verification_status,
+        verification_details=document.verification_details,
+        message="Re-scanned using text extracted in your browser.",
+    )
+
+
+# ---------- c) GET VERIFICATION STATUS ----------
+@router.get("/document/{document_id}/verification", response_model=DocumentVerificationResponse)
+def get_document_verification(
+    document_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    document = _get_document_or_404(document_id, db)
+    _ensure_can_access(document, current_user, db)
+    return DocumentVerificationResponse(
+        id=document.id,
+        type=document.type,
+        file_path=document.file_path,
+        verification_status=document.verification_status,
+        verification_details=document.verification_details,
+        message="Current verification status.",
+    )
+
+
+# ---------- f) ADMIN: list all documents ----------
+@router.get("/admin/documents", response_model=list[AdminDocumentListItem])
+def list_all_documents(
+    current_user: User = Depends(require_role(UserRole.admin)),
+    db: Session = Depends(get_db),
+):
+    documents = db.query(Document).order_by(Document.created_at.desc()).all()
+    student_ids = {d.student_id for d in documents}
+    students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
+    upload_root = Path(settings.upload_dir)
+
+    def _file_url(file_path: str) -> str:
+        try:
+            relative = Path(file_path).relative_to(upload_root).as_posix()
+            return f"{BACKEND_BASE_URL}/uploads/{relative}"
+        except ValueError:
+            return file_path
+
+    return [
+        AdminDocumentListItem(
+            id=d.id,
+            student_id=d.student_id,
+            student_name=students[d.student_id].name if d.student_id in students else None,
+            type=d.type,
+            file_url=_file_url(d.file_path),
+            verification_status=d.verification_status,
+            verification_details=d.verification_details,
+            created_at=d.created_at.isoformat() if d.created_at else "",
+        )
+        for d in documents
+    ]
+
+
+# ---------- d) VERIFY EXTERNAL PROFILES ----------
+@router.post("/verify-external-profiles", response_model=ExternalProfileVerificationResponse)
+def verify_external_profiles(
+    current_user: User = Depends(require_role(UserRole.student)),
+    db: Session = Depends(get_db),
+):
+    student = db.query(Student).filter(Student.user_id == current_user.id).first()
+    if student is None:
+        raise HTTPException(status_code=404, detail="Student profile not found for this account")
+
+    github_result = verify_github_profile(student.github_url)
+    leetcode_result = verify_leetcode_profile(student.leetcode_url)
+    linkedin_result = verify_linkedin_profile(student.linkedin_url)
+    portfolio_result = verify_portfolio_url(student.portfolio_url)
+
+    if github_result["github_verified"]:
+        student.github_username = github_result["github_username"]
+    if leetcode_result["leetcode_verified"]:
+        student.leetcode_username = leetcode_result["leetcode_username"]
+        if leetcode_result["leetcode_rating"] is not None:
+            student.leetcode_rating = leetcode_result["leetcode_rating"]
+
+    db.commit()
+    db.refresh(student)
+
+    return ExternalProfileVerificationResponse(
+        github=GithubVerification(**github_result),
+        leetcode=LeetcodeVerification(**leetcode_result),
+        linkedin=LinkedinVerification(**linkedin_result),
+        portfolio=PortfolioVerification(**portfolio_result),
+    )
