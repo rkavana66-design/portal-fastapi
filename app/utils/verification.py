@@ -2,6 +2,7 @@
 Certificate verification helpers (QR, text, tamper checks, AI review).
 """
 
+import io
 import os
 import re
 import time
@@ -581,16 +582,31 @@ def ai_review_certificate(file_path, account_name, account_college):
     try:
         import httpx
 
-        lower = raster_path.lower()
-        if lower.endswith(".png"):
-            mime = "image/png"
-        elif lower.endswith(".webp"):
-            mime = "image/webp"
-        else:
-            mime = "image/jpeg"
+        mime = "image/jpeg"
+        image_bytes = None
 
-        with open(raster_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode()
+        # Shrink big phone photos first: faster upload, less memory, quicker answer.
+        if HAS_PIL:
+            try:
+                img = Image.open(raster_path).convert("RGB")
+                img.thumbnail((1600, 1600))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                image_bytes = buf.getvalue()
+            except Exception as e:
+                print(f"[VERIFICATION] Image shrink failed, sending original: {e}")
+                image_bytes = None
+
+        if image_bytes is None:
+            lower = raster_path.lower()
+            if lower.endswith(".png"):
+                mime = "image/png"
+            elif lower.endswith(".webp"):
+                mime = "image/webp"
+            with open(raster_path, "rb") as f:
+                image_bytes = f.read()
+
+        image_b64 = base64.b64encode(image_bytes).decode()
 
         prompt = _AI_PROMPT.format(name=account_name or "unknown", college=account_college or "unknown")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{AI_MODEL}:generateContent"
@@ -602,13 +618,13 @@ def ai_review_certificate(file_path, account_name, account_college):
             "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
         }
 
-        # Retry a few times: 429 / 500 / 503 are usually short Google-side spikes.
+        # Short retry: 429 / 500 / 503 are usually brief Google-side spikes.
         resp = None
-        for attempt in range(3):
-            resp = httpx.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=60)
+        for attempt in range(2):
+            resp = httpx.post(url, headers={"x-goog-api-key": api_key}, json=body, timeout=30)
             if resp.status_code not in (429, 500, 503):
                 break
-            time.sleep(4 * (attempt + 1))
+            time.sleep(3)
 
         if resp.status_code != 200:
             msg = f"Google answered HTTP {resp.status_code}: {resp.text[:150]}"
